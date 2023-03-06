@@ -1,0 +1,520 @@
+---
+title: "Analyse du coefficient de condition de la truite en Occitanie"
+author: "OFB - DR Bretagne"
+date: "`r format(Sys.time(), 'Le %d %B %Y')`"
+output:
+  bookdown::html_document2:
+    fig_caption: yes
+    tab_caption: yes
+    number_sections: yes
+    global_numbering: yes
+    toc: yes
+    toc_float:
+      toc_collapsed: yes
+      toc_depth: 2
+    code_folding: hide
+params:
+  code_espece: "TRF"
+  code_region: 76 # Occitanie
+  fulton_mini: 0.6
+  fulton_maxi: 1.6
+  limites_classes_taille: !r c(0, 100, 150, 200, 250, 9999)  
+  etiquettes_classes_taille: !r c("<100mm", "100-150mm", "150-200mm", "200-250mm", ">250mm")
+---
+
+
+# Initialisation du projet
+
+## Paramétrages
+
+Le présent document est paramétrable en choisissant les champs de la rubrique `params` de l'en-tête du document R Markdown.
+
+On paramètre aussi la visibilité du code et des différents messages retournés lors de son exécution.
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+
+
+
+## Chargement des packages
+
+```{r}
+library(aspe) # traitement des données ASPE
+library(aspeQual) # mise en qualité des données ASPE
+library(tidyverse) # mise en forme des données
+library(mapview) # cartes interactives
+library(sf) # analyse spatiale
+library(ggridges) # graphiques (surcouche de ggplot2)
+library(flextable) # affichage de tables bien présentées
+```
+
+## Chargement des données
+
+La fonction `misc_nom_dernier_fichier()` du package `aspe` renvoie le nom du fichier le plus récent dont le nom contient le *pattern* spécifié.
+
+```{r}
+# retrieve most recent data files
+rdata_tables <-
+  misc_nom_dernier_fichier(repertoire = "../../../../raw_data/rdata",
+                           pattern = "^tables")
+
+rdata_mei <-
+  misc_nom_dernier_fichier(repertoire = "../../../../raw_data/rdata",
+                           pattern = "^mei")
+# load them
+load(rdata_tables)
+load(rdata_mei)
+```
+
+# Jointures et sélection
+
+On met en correspondance les identifiants des stations, popints de prélèvements, opération, etc. A ce stade le jeu de données est national sans filtre de période.
+
+```{r}
+# passerelle de correspondance des identifiants entre tables
+passerelle <- mef_creer_passerelle()
+
+passerelle %>% 
+  mutate_all(as.character) %>% 
+  head() %>% 
+  flextable::flextable() %>% 
+  set_caption("Quelques lignes de la table de correspondance entre les identifiants des stations (sta_id, pas toujours renseigné), points de prélèvement (pop_id), opération (ope_id), prélèvement individuel (pre_id) et lot (lop_id).")
+```
+
+# Sélection de la région
+
+On ne conserve que les opérations des départements de la région et à partir de 2007.
+
+Liste des départements de la région (donnée intégrée dans le package COGiter).
+
+```{r}
+# départements de la région
+mes_depts <- COGiter::departements %>% 
+  filter(REG == params$code_region) %>% 
+  pull(DEP) %>% 
+  as.character()
+```
+
+Départements retenus : `r paste(mes_depts, collapse = ", ")``
+
+On filtre le jeu de données national, sélectionne les variables d'intérêt, puis ajoute les infos département, code sandre etc.
+
+```{r}
+passerelle <- passerelle %>%
+  mef_ajouter_dept() %>%
+  filter(dept %in% mes_depts) %>% # filtrage des départements
+  mef_ajouter_ope_date() %>%
+  mef_ajouter_lots() %>% 
+  mef_ajouter_type_lot() %>% 
+  mef_ajouter_esp() %>% 
+  mef_ajouter_libelle() %>% 
+  select(sta_id:annee, dept, tyl_libelle, esp_code_alternatif, pop_libelle) %>% 
+  distinct()
+```
+
+```{r}
+passerelle %>% 
+  head() %>% 
+  mutate_if(is.integer, as.character) %>% 
+  mutate(ope_date = as.Date(ope_date),
+         annee = as.character(annee)) %>%
+  flextable::flextable() %>% 
+  colformat_int(j = 3, big.mark = " ") %>% 
+  colformat_double(j = 4:5, digits = 3) %>% 
+  align(j = 1:5, align = "center", part = "all") %>% 
+  set_table_properties(layout = "autofit", width = .9) %>% 
+  set_caption("Exemple de lignes du tableau de données intermédiaire.")
+```
+
+
+# Mesures individuelles
+
+## Constitution du tableau
+
+Ajout des mesures individuelles.
+
+```{r}
+mei <- passerelle %>% 
+  mef_ajouter_mei() %>% 
+  filter(mei_mesure_reelle == "t",
+         tyl_libelle == "N",
+         !is.na(mei_taille)) %>% 
+  mutate(mei_poids_bis = ifelse(test = is.na(mei_poids),
+                            yes = mei_poids_estime,
+                            no = mei_poids)) %>% 
+  filter(!is.na(mei_poids_bis))
+```
+
+Sélection des truites, calcul de Fulton et des classes de taille sur les individus. Les individus avec les coefficients de condition hors norme (intervalle [`r params$fulton_mini`, `r params$fulton_maxi`], paramétrable dans l'en-tête du présent document à la rubrique `params`) sont écartés du jeu de données.
+
+```{r}
+data_ind <- mei %>%
+  filter(esp_code_alternatif == params$code_espece,
+         mei_poids_bis > 0) %>%
+  mutate(
+    fulton = 100 * mei_poids_bis / (mei_taille / 10) ^ 3,
+    classe_taille = cut(
+      mei_taille,
+      breaks = params$limites_classes_taille,
+      labels = params$etiquettes_classes_taille
+    )
+  ) %>%
+  filter(fulton > params$fulton_mini,
+         fulton < params$fulton_maxi) %>% 
+  left_join(y = point_prelevement %>%
+              select(pop_id,
+                     pop_altitude)) %>%
+  select(
+    pop_id,
+    pop_libelle,
+    dept,
+    pop_altitude,
+    ope_date,
+    annee,
+    mei_id,
+    mei_taille,
+    mei_poids_bis,
+    fulton,
+    classe_taille
+  )
+```
+
+```{r}
+data_ind %>% 
+  head() %>% 
+  mutate_if(is.integer, as.character) %>% 
+  mutate(ope_date = as.Date(ope_date),
+         annee = as.character(annee)) %>%
+  flextable::flextable() %>% 
+  colformat_int(j = c(4, 9), big.mark = " ") %>% 
+  colformat_double(j = 10, digits = 3) %>% 
+#  align(j = 1:5, align = "center", part = "all") %>% 
+  set_table_properties(layout = "autofit", width = .9) %>% 
+  set_caption("Exemple de lignes du tableau de mesures individuelles. Dans la variable `mei_poids_bis`, les vareuls manquantes de `mei_poids` sont remplacées mar `mei_poids_estime` s'il s'agit de lots `N` et que `mei_mesure_reelle` est taggé `t`. C'est `mei_poids_bis` qui sert au calcul de coefficient de condition.")
+```
+
+## Résumé 
+
+### Les années d'échantillonnage
+
+```{r, fig.cap = "Nombre d'individus mesurés chaque année."}
+resume_data <- data_ind %>% 
+  group_by(annee) %>% 
+    summarise(n_indiv = n_distinct(mei_id),
+              n_points = n_distinct(pop_id)) 
+
+ggplot(data = resume_data,
+       aes(x = annee,
+           y = n_indiv)) +
+  geom_bar(stat = "identity") +
+  labs(x = "Année",
+       y = "Nombre d'individus mesurés") +
+  scale_y_continuous(labels = scales::comma_format(big.mark = ' '))
+```
+
+
+### Les longueurs
+
+```{r, fig.cap = "Distribution des longueurs avec la médiane en pointillés rouges."}
+ggplot(data = data_ind,
+       aes(x = mei_taille)) +
+  geom_histogram() +
+#  geom_density(bins = 50)+
+  scale_x_continuous(limits = c(0, 400)) +
+  scale_y_continuous(labels = scales::comma_format(big.mark = ' ')) +
+  geom_vline(xintercept = median(data_ind$mei_taille, na.rm = TRUE),
+             col = "red",
+             linetype = "dashed") +
+  labs(x = "Longueur (mm)",
+       y = "Nombre d'individus")
+```
+
+>Difficile de distinguer les 0+.
+
+
+```{r, fig.height = 20, fig.width = 4.5, fig.cap = "Variations interannuelle de la distribution des tailles des individus mesurés (densités de probabilité ; se lit comme un histogramme qui serait lissé)."}
+ggplot(data = data_ind,
+       aes(x = mei_taille, y = as.factor(annee))) +
+  ggridges::geom_density_ridges(quantile_lines = FALSE,
+                                alpha = 0.5) +
+  scale_x_continuous(limits = c(0, 400)) +
+  labs(x = "Longueur (mm)",
+       y = "Année")
+```
+
+
+
+
+### Les coefficients de condition
+
+```{r, fig.cap = "Distribution des coefficients de condition avec la médiane en pointillés rouges."}
+ggplot(data = data_ind,
+       aes(x = fulton)) +
+  geom_histogram() +
+  scale_x_continuous(limits = c(params$fulton_mini, params$fulton_maxi)) +
+  geom_vline(xintercept = median(data_ind$fulton, na.rm = TRUE),
+             col = "red",
+             linetype = "dashed")
+```
+
+```{r, fig.height = 20, fig.width = 4.5, fig.cap = "Variations interannuelle de la distribution des coefficients de condition (densités de probabilité ; se lit comme un histogramme qui serait lissé)."}
+ggplot(data = data_ind,
+       aes(x = fulton,
+           y = as.factor(annee))) +
+  ggridges::stat_density_ridges(quantile_lines = FALSE,
+                                alpha = 0.5) +
+  labs(x = "Coefficient de condition de Fulton",
+       y = "Année")
+```
+
+
+# Effet année
+
+## Sur toute la région
+
+Calcul, pour chaque combinaison année x classe_taille x département, du coefficient de condition médian.
+
+```{r}
+data_mediane_ope <- data_ind %>% 
+  group_by(annee, classe_taille, dept, pop_id) %>% 
+    summarise(fulton_median = median(fulton, na.rm = TRUE))
+```
+
+```{r}
+data_mediane_ope %>% 
+  head() %>% 
+  mutate_if(is.integer, as.character) %>% 
+  mutate(annee = as.character(annee)) %>%
+  flextable::flextable() %>% 
+  colformat_int(j = 3, big.mark = " ") %>% 
+  colformat_double(j = 5, digits = 3) %>% 
+  align(j = 1:5, align = "center", part = "all") %>% 
+  set_table_properties(layout = "autofit", width = .9) %>% 
+  set_caption("Exemple de lignes du tableau de données sur les Fulton médians par année, opération et classe de taille.")
+```
+
+
+
+```{r, fig.cap = "Pour chaque classe de taille, relation entre le coefficient de Fulton médian et l'année. Chaque point représente une opération."}
+ggplot(data = data_mediane_ope,
+       aes(x = annee,
+           y = fulton_median)) +
+  geom_point(size = 0.2) +
+  geom_smooth(method = "lm", se = FALSE) +
+  scale_y_continuous(limits = c(0.8, 1.4)) +
+  #scale_x_continuous(limits = c(0, 700)) +
+  facet_wrap(facets = vars(classe_taille),
+             scales = "free_y") +
+  labs(x = "Année",
+       y = "Coefficient de condition")
+```
+
+## Décliné par département
+
+```{r, fig.cap = "Pour chaque combinaison classe de taille x département, relation entre le coefficient de Fulton médian et l'année. Chaque point représente une opération."}
+ggplot(data = data_mediane_ope,
+       aes(x = annee,
+           y = fulton_median)) +
+  geom_point(size = 0.2) +
+  geom_smooth(method = "lm", se = FALSE) +
+  scale_y_continuous(limits = c(0.8, 1.4)) +
+  facet_grid(cols = vars(classe_taille),
+             rows = vars(dept),
+             scales = "free_y") +
+  labs(x = "Année",
+       y = "Coefficient de condition")
+```
+
+# Lien condition - altitude
+
+## Toutes tailles
+
+```{r, fig.cap = "Pour chaque département, relation entre le coefficient de Fulton médian et l'altitude. Chaque point représente une opération."}
+data_ind <- data_ind %>% 
+  filter(pop_altitude > 0)
+
+data_mediane_an_ct_dept_alt <- data_ind %>% 
+  group_by(annee, dept, pop_id, pop_altitude, classe_taille) %>% 
+    summarise(fulton_median = median(fulton, na.rm = TRUE),
+              altitude_mediane = median(pop_altitude, na.rm = TRUE)) %>% 
+  filter(fulton_median > params$fulton_mini,
+         fulton_median < params$fulton_maxi)
+
+ggplot(data = data_mediane_an_ct_dept_alt,
+       aes(x = altitude_mediane,
+           y = fulton_median)) +
+  geom_point(size = 0.2) +
+  geom_smooth(method = 'lm') +
+  scale_x_continuous(limits = c(0, 700)) +
+  facet_wrap(vars(dept), scale = "free") +
+  labs(x = "Altitude",
+       y = "Coefficient de Fulton médian")
+```
+
+## Déclinaison par classe de taille
+
+```{r, fig.cap = "Pour chaque département et chaque classe de taille, relation entre le coefficient de Fulton médian et l'altitude. Chaque point représente une opération."}
+ggplot(data = data_mediane_an_ct_dept_alt,
+       aes(x = pop_altitude,
+           y = fulton_median)) +
+  geom_point(size = 0.2) +
+  geom_smooth(method = 'lm') +
+  scale_x_continuous(limits = c(0, 700)) +
+  facet_grid(rows = vars(dept),
+             cols = vars(classe_taille),
+             scale = "free") +
+  labs(x = "Altitude",
+       y = "Coefficient de Fulton médian")
+```
+
+# Essais de modélisation
+
+On tente ici de tester de potentiels effets de l'année et de l'altitude sur le coefficient de condition.
+
+## Bivariée
+
+
+
+### Effet classe de taille
+
+
+```{r}
+data_ind %>% 
+  group_by(classe_taille) %>% 
+    summarise(n_sites = n_distinct(pop_id),
+              n_indiv = n_distinct(mei_id),
+              fulton_median = median(fulton, na.rm = TRUE),
+              fulton_ecart_type = sd(fulton, na.rm = TRUE)) %>% 
+  flextable::flextable() %>% 
+  colformat_int(j = 3, big.mark = " ") %>% 
+  colformat_double(j = 4:5, digits = 3) %>% 
+  align(j = 1:5, align = "center", part = "all") %>% 
+  set_table_properties(layout = "autofit", width = .9) %>% 
+  set_caption("Table descriptive des valeurs du coefficient de condition, par classe de taille.")
+```
+
+  Comparaisons de moyennes dans l'ensemble (ANOVA).
+
+```{r}
+anova1 <- aov(fulton_median ~ classe_taille, data = data_mediane_an_ct_dept_alt)
+
+summary(anova1)
+```
+
+Il y a un effet classe de taille sur le Fulton moyen (`Pr(>F)` < 5%) => Test post_hoc pour voir quelles classes de taille diffèrent 2 à 2 avec un test de Tukey.
+
+```{r}
+tuk <- TukeyHSD(anova1)
+
+tuk$classe_taille %>% 
+  as.data.frame() %>%
+  mutate(sig = case_when(`p adj` < 0.001 ~ "***",
+                         `p adj` < 0.01 ~ "**",
+                         `p adj` < 0.05 ~ "*",
+                         TRUE ~ ""))
+```
+
+
+
+### Effet année
+
+L'année est une variable qui caractérise les opérations, non les individus, donc on aggrège les données individuelles avant de tester.
+
+```{r}
+data <- data_ind %>% 
+  mutate(annee = as.character(annee)) %>% 
+  group_by(annee) %>% 
+    summarise(n_sites = n_distinct(pop_id),
+              n_indiv = n_distinct(mei_id),
+              fulton_mediane = median(fulton, na.rm = TRUE),
+              fulton_ecart_type = sd(fulton, na.rm = TRUE))
+
+data %>% 
+  flextable::flextable() %>% 
+  colformat_int(j = 1:3, big.mark = " ") %>% 
+  colformat_double(j = 4:5, digits = 3) %>% 
+  align(j = c(1, 4, 5), align = "center", part = "all") %>% 
+  set_table_properties(layout = "autofit", width = .9) %>% 
+  set_caption("Table descriptive des valeurs du coefficient de condition, par année.")
+```
+
+
+```{r}
+anova2 <- aov(fulton ~ as.factor(annee), data = data_ind)
+summary(anova2)
+anova2
+```
+
+Anova => Il y a des différences interannuelles dans les coefficients moyens.
+
+Effet linéaire ?
+Régression simple
+
+```{r}
+lm1 <- lm(fulton_mediane ~ as.integer(annee), data = data)
+summary(lm1)
+```
+
+On conclut qu'il y a des différences interannuelles significatives sur les coefficients moyens, mais pas de tendance temporelle linéaire.
+
+### Effet de l'altitude
+
+```{r}
+data <- data_ind %>% 
+  group_by(pop_id, pop_altitude) %>% 
+    summarise(pop_altitude = median(pop_altitude, na.rm = TRUE),
+              fulton_mediane = median(fulton, na.rm = TRUE))
+```
+
+
+```{r}
+modele <- lm(fulton_mediane ~ pop_altitude, data = data)
+summary(modele)
+```
+
+On a un léger effet simple altitude, avec une tendance à des poissons plus "trapus" en altitude.
+
+## Multiple
+
+```{r}
+data <- data_ind %>% 
+  group_by(pop_id, pop_altitude, classe_taille, annee) %>% 
+    summarise(pop_altitude = median(pop_altitude, na.rm = TRUE),
+              fulton_mediane = median(fulton, na.rm = TRUE))
+```
+
+```{r}
+mod1 <- lm(fulton_mediane~annee+pop_altitude+classe_taille,
+           data = data)
+
+summary(mod1)
+```
+
+
+
+=> Les effets altitude et classe de taille sont confirmés, mais toujours pas d'effet année.
+
+
+# Graphiques en vrac
+
+```{r}
+ggplot(data = data_mediane_an_ct_dept_alt,
+       aes(x = classe_taille,
+           y = fulton_median)) +
+  geom_boxplot()
+```
+
+
+```{r}
+ggplot(data = data_mediane_an_ct_dept_alt,
+       aes(x = annee,
+           y = fulton_median,
+           col = classe_taille)) +
+  geom_jitter(size = 0.2) +
+  geom_smooth()
+```
+
+
+
